@@ -1,0 +1,13 @@
+#!/bin/sh
+# DIR-825 G1 first-boot: allow temporary management from the WAN side
+# (router hangs off the Jio Fiber LAN; will be locked down after setup)
+uci batch <<'UCI'
+add firewall rule
+set firewall.@rule[-1].name='Allow-WAN-Management'
+set firewall.@rule[-1].src='wan'
+set firewall.@rule[-1].proto='tcp'
+set firewall.@rule[-1].dest_port='22 80 443'
+set firewall.@rule[-1].target='ACCEPT'
+commit firewall
+UCI
+exit 0
