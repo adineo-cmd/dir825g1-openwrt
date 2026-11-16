@@ -1,96 +1,130 @@
+<div align="center">
+
 # DIR-825 G1 OpenWrt Port
 
-Everything needed to bring OpenWrt to the **D-Link DIR-825 G1** (hardware revision G1, Realtek RTL8197DN) — a router officially listed as *unsupported* by OpenWrt, with zero community firmware available.
+**Bringing OpenWrt to a router that OpenWrt does not support.**
 
-This repo contains the working device port, the fully reverse-engineered stock firmware image format, flash/recovery tooling, and an honest engineering log of every problem encountered — including the one that bricked our unit.
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white) ![OpenWrt](https://img.shields.io/badge/OpenWrt-00B5E2?logo=openwrt&logoColor=white) ![Bash](https://img.shields.io/badge/Bash-4EAA25?logo=gnubash&logoColor=white)
 
-**Base codebase:** [choryuidentify/openwrt-rtl8197f](https://github.com/choryuidentify/openwrt-rtl8197f) (kernel 4.14, `realtek/rtl8197d` subtarget).
+[![Stars](https://img.shields.io/github/stars/adineo-cmd/dir825g1-openwrt?style=flat&logo=github&label=stars)](https://github.com/adineo-cmd/dir825g1-openwrt/stargazers) [![Last commit](https://img.shields.io/github/last-commit/adineo-cmd/dir825g1-openwrt?style=flat)](https://github.com/adineo-cmd/dir825g1-openwrt/commits)
 
----
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Features](#features)
 
-## Current status (2026-10-25)
-
-| Item | State |
-|---|---|
-| Device tree + image definition | ✅ done, builds clean |
-| Stock image format (TBS TLV) reverse-engineered | ✅ complete, verified against binaries |
-| Custom CRC-32 recovered from upgrader binary | ✅ verified |
-| Factory image builder | ✅ works |
-| Root shell via stock fw 7.00 RCE | ✅ worked (until flash) |
-| Ethernet under OpenWrt | 🔶 built, **not yet booted** |
-| Wi-Fi (RTL8192ER 2.4G + RTL8812AR 5G) | ❌ experimental, drivers included but untested |
-| **Our test router** | 🔴 **bricked** by bad kernel LZMA props (see warning #2) — bootloader intact, serial-console recovery pending USB-TTL adapter |
+</div>
 
 ---
 
-## ⚠️ WARNINGS — read before touching a DIR-825 G1
+The **D-Link DIR-825 G1** (Realtek RTL8197DN, 8 MB SPI NOR, 64 MB RAM) has no
+official OpenWrt target and no community firmware. This repository contains the
+device port, the reverse-engineered stock image format, the flashing and recovery
+tooling, and an honest log of everything that went wrong.
 
-These were all learned first-hand. Numbered by how likely they are to ruin your day.
+**Including the mistake that bricked the test unit.** Every warning below was
+learned first-hand; read them before flashing anything.
 
-1. **Never flash Atheros (B1/C1) images on a G1.** The DIR-825 name covers completely different boards. G1 = Realtek RTL8197DN @660MHz, 8MB SPI NOR, 64MB RAM. A B1/C1 image is a guaranteed hard brick.
-2. **The bootloader only accepts LZMA props byte `0x5d`** (lc=3, lp=0, pb=2), 8MB dict. OpenWrt's default kernel pipeline produces `0x6d` (lc=1, lp=2) — the bootloader **silently fails to decompress it and boot-loops**. Always repack the kernel stream (`tools/make_factory_image.py --fix-lzma`). *This exact mistake bricked our unit.*
-3. **Any reboot while `/var/update_img` exists flashes `/var/image.img`** — the stock kernel's `machine_restart` handler checks for the flag file on *every* reboot, not just upgrade-initiated ones. Staging an image + flag and then rebooting by any other path = uncontrolled flash. Ask me how I know.
-4. **There is NO network recovery room on the G1.** The on-flash bootloader contains no network stack at all — no IP, no TFTP, no HTTP (verified by disassembling a full mtd0 dump). The D-Link "hold reset → 192.168.0.1 emergency page" procedure does not exist on this model. **UART serial console is the only rescue.** (DIR-815 D1 DTS says 115200 8N1.)
-5. **mtd0 (boot) holds per-device data in its config sectors** — MAC address, serial, Wi-Fi calibration MIBs (XCAP/THER/tx-power tables, incl. 5G). Never erase or overwrite mtd0/mtd3. Full dumps of our unit are kept **out** of this repo deliberately (they contain private data: MAC, serial, Wi-Fi password).
-6. **Userspace cannot write the flash** — `cat x > /dev/mtdblockN` and `> /dev/mtdN` both fail (custom Realtek mtd layer). Only the kernel `flash_update_img` path can write. Don't waste an evening on it.
-7. **Stock fw 7.00 webupg dies on long command output** — the httpd kills the CGI. Background long jobs (`cmd &`) + poll a flag file; for binary data pipe through `openssl base64` (strips its WARNING lines locally). The webupg module also jams permanently ("Init webupg module error") after standalone `/usr/bin/upgrader` runs — only a reboot clears it.
-8. **The official 7.12B01 hotfix file is SHRS-encrypted and useless as a format template** — and the 7.00-era upgrader's product check wants `RTL8197DN_AC1200`, so even correctly-built images with a different product string are rejected with a generic error.
-9. **A sandboxed TFTP server never receives LAN UDP** (host tool confinement). Run the transfer server unsandboxed.
-10. **`/usr/bin/upgrader` exits 42 when run standalone** — it needs the message-bus daemon context. Don't try to drive it by hand; use the reboot-flag path or the web UI.
-11. **Stock firmware 7.xx has unpatched auth-bypass + RCE** (D-Link advisory SAP10294, EOL — never fixed). Public PoC: [t0ptop/D-Link-DIR-825](https://github.com/t0ptop/D-Link-DIR-825). Never expose a G1's web UI to the internet. Our tooling uses this RCE on **our own router** for research.
-12. **`tbs_dlink` host tool is missing** from the base repo (the author never committed it), which breaks the DIR-815 D1 build — disabled in our config. The TBS header it used to emit is now generated by `tools/make_factory_image.py` from RE findings.
-13. **Building the 2019-era tree on a modern host needs two fixes**: m4 1.4.18 SIGSTKSZ patch (included in `patches/`) and gcc-13/python-3.12 regex updates in `include/prereq-build.mk`.
+## Features
 
----
+| | Feature | What it does |
+| --- | --- | --- |
+| 🧩 | **Device port** | Device tree, image definition and first-boot script for the RTL8197D subtarget. |
+| 🔬 | **TBS image format** | The stock TLV container and its custom CRC-32, recovered from the upgrader binary and verified against real images. |
+| 🛠️ | **Tooling** | Factory image builder with LZMA repacking, raw flash writer, TFTP server and a stock-firmware shell. |
+| 📓 | **Engineering log** | Thirteen numbered warnings learned the hard way, each with the failure it prevents. |
 
-## Hardware (verified from our unit, not wiki hearsay)
+## How it works
 
-| | |
-|---|---|
-| SoC | Realtek RTL8197DN (Lexra-derived `rlx5281` core), string on flash: `RTL8197DN_AC1200` |
-| RAM | 64 MB |
-| Flash | 8 MB SPI NOR |
-| Radios | 2.4G integrated + 5G (PCIe), calibration in mtd0 config sectors |
-| Ethernet | 5× GbE (internal switch) |
-| Serial | UART header on PCB, 115200 8N1 (per sibling DIR-815 D1 DTS) |
+The port follows the hardware, not the marketing name:
 
-## Flash layout (from `/proc/mtd` + boot config sector — sizes are *this unit's* dynamic values)
+1. Identify the exact board revision and its flash layout.
+2. Dump `mtd0` and disassemble the bootloader to learn what it will accept.
+3. Recover the stock container and checksum from the vendor upgrader.
+4. Build a factory image, repack the kernel with the LZMA properties the
+   bootloader demands, and flash it.
+5. Log every failure so the next person does not repeat it.
 
-```
-mtd0 boot       0x000000 0x30000   (192K) bootloader + llconfig (MAC/cal/serial) — READ-ONLY, NEVER WRITE
-mtd1 kernel     0x030000 0x1A2D00 (dynamic; raw LZMA stream, no header)
-mtd2 rootfs     0x1D2D00 0x60D300 (dynamic; squashfs, magic 'hsqs' at partition start)
-mtd3 multi_lang 0x7E0000 0x20000  (128K) gzipped language pack
-(hidden mtd4/mtd5 device nodes exist with no partition entries — purpose unknown)
-```
-
-The kernel/rootfs sizes above are what our unit's llconfig declared; the boot-config sector is the source of truth (stock kernel parses it at boot). `openwrt-device/DIR825G1.dts` encodes exactly this layout.
-
-## What's in this repo
-
-```
-openwrt-device/
-  DIR825G1.dts            device tree for the realtek/rtl8197d target
-  image-DIR825G1.mk       Device/DIR825G1 definition (sysupgrade image)
-  99-dir825-firstboot     uci-defaults: temporary WAN-side mgmt rule (lock down after!)
-patches/
-  010-modern-glibc-sigstksz.patch   host m4 build fix for modern glibc
-tools/
-  make_factory_image.py   builds the TBS-format factory image (--fix-lzma REQUIRED)
-  rce_shell.py            root command exec on stock fw 7.00 (own router only)
-  tftp_server.py          minimal TFTP server for pushing files to the box
-  flash_raw.py            staged kernel+rootfs writer via RCE (pre-brick method)
-  restart2.s              hand-assembled sys_reboot() "restart with command" stub
-docs/
-  REVERSE-ENGINEERING.md  full TBS image format, CRC, kernel update path, disasm notes
+```mermaid
+flowchart LR
+  A[Stock firmware] --> B[Upgrader analysis]
+  B --> C[TBS TLV format + CRC-32]
+  C --> D[make_factory_image.py]
+  D --> E[Factory image]
+  E --> F[Bootloader]
+  G[Device tree + image mk] --> D
+  H[UART console] --> I[Recovery]
+  F -->|bad LZMA props| I
 ```
 
-## The story in one paragraph
+## Quick start
 
-Wiki said G1 = unsupported, end of story. We found the `rtl8197d` target inside choryuidentify's fork whose DIR-815 D1 factory image was literally stamped `-m DIR825G1 -p RTL8197DL_AC1200` — a near-miss (wrong product suffix). We got root on the stock firmware via its own unpatched RCE, dumped every partition (md5-verified), disassembled `upgrader` to recover the complete TBS image format *including a custom CRC variant*, built OpenWrt with a proper DIR825G1 device, verified a TFTP delivery path, and flashed — only to brick on the one thing nobody documented: the bootloader's LZMA decoder only accepts `0x5d` properties. The corrected image (which we verified byte-by-byte against stock's format) was built 20 minutes too late. The unit awaits a ₹150 USB-TTL adapter for serial recovery; the bootloader itself is untouched and healthy.
+Python 3.10+. Building the firmware needs a Linux host with the OpenWrt build dependencies; recovery needs a USB-TTL adapter.
 
-## Credits
+**Build an image**
 
-- [choryuidentify](https://github.com/choryuidentify) — the rtl8197d/rtl8197f OpenWrt target this builds on
-- [t0ptop / KeenSight Lab](https://github.com/t0ptop/D-Link-DIR-825) — public PoC for the SAP10294 auth-bypass + RCE
-- D-Link — for the firmware, and for never fixing it
+```bash
+python3 tools/make_factory_image.py --help
+python3 tools/make_factory_image.py --fix-lzma
+```
+
+**Recovery**
+
+```bash
+python3 tools/tftp_server.py --help
+python3 tools/flash_raw.py --help
+```
+
+## Project structure
+
+```text
+openwrt-device/    DTS, image definition, first-boot script
+patches/            build fixes for a modern host
+tools/              image builder, flash writer, TFTP server, RE shell
+docs/               full reverse-engineering write-up
+```
+
+## Read these before flashing
+
+1. **Never flash a B1/C1 image on a G1.** They are completely different boards; it
+   is a guaranteed hard brick. G1 = RTL8197DN @660 MHz, 8 MB NOR, 64 MB RAM.
+2. **The bootloader only accepts LZMA properties byte `0x5d`** (lc=3, lp=0, pb=2,
+   8 MB dict). OpenWrt's default pipeline emits `0x6d`, which the bootloader
+   silently fails to decompress — it boot-loops. Repack with `--fix-lzma`. This is
+   the exact mistake that bricked the test unit.
+3. **Any reboot while `/var/update_img` exists flashes `/var/image.img`.** The
+   stock kernel's `machine_restart` handler checks the flag on *every* reboot, not
+   just upgrade-initiated ones.
+4. **There is no network recovery.** The bootloader contains no IP, TFTP or HTTP
+   stack (verified from a full `mtd0` dump). The usual D-Link "hold reset →
+   192.168.0.1" page does not exist on this model. UART is the only rescue.
+5. **Never erase or overwrite `mtd0`/`mtd3`.** Their config sectors hold the MAC
+   address, serial number and Wi-Fi calibration tables. Device dumps are kept out
+   of this repository for that reason.
+6. **Userspace cannot write the flash.** `> /dev/mtdN` and `> /dev/mtdblockN` both
+   fail against the custom Realtek mtd layer; only the kernel
+   `flash_update_img` path writes.
+7. **Stock firmware 7.00 `webupg` dies on long command output.** Background long
+   jobs and poll a flag file; pipe binary data through `openssl base64`. The module
+   also jams after a standalone `/usr/bin/upgrader` run and only a reboot clears it.
+8. **The official 7.12B01 hotfix is SHRS-encrypted** and useless as a format
+   template. The 7.00-era upgrader also wants the product string
+   `RTL8197DN_AC1200`, so anything else is rejected with a generic error.
+9. **A sandboxed TFTP server never receives LAN UDP.** Run the transfer server
+   unsandboxed.
+10. **`/usr/bin/upgrader` exits 42 standalone** — it needs the message-bus daemon
+    context. Use the reboot-flag path or the web UI.
+11. **Stock firmware 7.xx has an unpatched auth-bypass and RCE** (D-Link advisory
+    SAP10294, EOL). Never expose a G1's web UI to the internet. This project's
+    tooling uses that RCE on its own router, for research only.
+12. **`tbs_dlink` is missing from the base repository**, which breaks the DIR-815
+    D1 build. The TBS header is now generated by `tools/make_factory_image.py`.
+13. **Building the 2019-era tree on a modern host needs two fixes**: the m4 1.4.18
+    SIGSTKSZ patch in `patches/`, and gcc-13 / Python 3.12 regex updates in
+    `include/prereq-build.mk`.
+
+`docs/REVERSE-ENGINEERING.md` walks the full flash path, including the exact
+`flash_update_img` behaviour and the bootloader disassembly.
+
+## Status
+
+The port builds clean and the image format is fully verified. Ethernet is built
+but not yet booted; Wi-Fi is experimental. The test unit needs serial recovery
+once a USB-TTL adapter is available.
